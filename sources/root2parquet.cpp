@@ -75,7 +75,7 @@ int main(int argc, char **argv)
     // Map of Apache Arrow Builders, and corresponding fill functions
     auto pool = arrow::default_memory_pool();
     std::map<std::string, std::shared_ptr<arrow::ArrayBuilder>> builders;
-    arrow::FieldVector fields;
+    std::map<std::string, std::shared_ptr<arrow::Field>> fields;
     std::map<std::string, std::function<void(const std::string &)>> functions;
     // Map of ROOT TTreeReaderValues and Arrays
     std::map<std::string, ROOT::Internal::TTreeReaderArrayBase *> arrayReaders;
@@ -108,7 +108,7 @@ int main(int argc, char **argv)
             if (lType == "Double_t")
             {
                 builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
-                fields.emplace_back(arrow::field(lName, arrow::float64()));
+                fields[lName] = (arrow::field(lName, arrow::float64()));
                 valueReaders[lName] = new TTreeReaderValue<Double_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &valueReaders](const std::string &name)
                 {
@@ -118,7 +118,7 @@ int main(int argc, char **argv)
             else if (lType == "Float_t")
             {
                 builders[lName] = std::make_shared<arrow::FloatBuilder>(pool);
-                fields.emplace_back(arrow::field(lName, arrow::float32()));
+                fields[lName] = (arrow::field(lName, arrow::float32()));
                 valueReaders[lName] = new TTreeReaderValue<Float_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &valueReaders](const std::string &name)
                 {
@@ -128,7 +128,7 @@ int main(int argc, char **argv)
             else if (lType == "Int_t")
             {
                 builders[lName] = std::make_shared<arrow::Int32Builder>(pool);
-                fields.emplace_back(arrow::field(lName, arrow::int32()));
+                fields[lName] = (arrow::field(lName, arrow::int32()));
                 valueReaders[lName] = new TTreeReaderValue<Int_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &valueReaders](const std::string &name)
                 {
@@ -138,7 +138,7 @@ int main(int argc, char **argv)
             else if (lType == "Long64_t")
             {
                 builders[lName] = std::make_shared<arrow::Int64Builder>(pool);
-                fields.emplace_back(arrow::field(lName, arrow::int64()));
+                fields[lName] = (arrow::field(lName, arrow::int64()));
                 valueReaders[lName] = new TTreeReaderValue<Long64_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &valueReaders](const std::string &name)
                 {
@@ -148,7 +148,7 @@ int main(int argc, char **argv)
             else if (lType == "ULong64_t")
             {
                 builders[lName] = std::make_shared<arrow::UInt64Builder>(pool);
-                fields.emplace_back(arrow::field(lName, arrow::uint64()));
+                fields[lName] = (arrow::field(lName, arrow::uint64()));
                 valueReaders[lName] = new TTreeReaderValue<ULong64_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &valueReaders](const std::string &name)
                 {
@@ -160,7 +160,7 @@ int main(int argc, char **argv)
             {
                 builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields.emplace_back(arrow::field(lName + "L", arrow::list(arrow::float64())));
+                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::float64())));
                 arrayReaders[lName] = new TTreeReaderArray<Double_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &arrayReaders](const std::string &name)
                 {
@@ -175,7 +175,7 @@ int main(int argc, char **argv)
             {
                 builders[lName] = std::make_shared<arrow::FloatBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields.emplace_back(arrow::field(lName + "L", arrow::list(arrow::float32())));
+                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::float32())));
                 arrayReaders[lName] = new TTreeReaderArray<Float_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &arrayReaders](const std::string &name)
                 {
@@ -190,7 +190,7 @@ int main(int argc, char **argv)
             {
                 builders[lName] = std::make_shared<arrow::Int32Builder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields.emplace_back(arrow::field(lName + "L", arrow::list(arrow::int32())));
+                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::int32())));
                 arrayReaders[lName] = new TTreeReaderArray<Int_t>(reader, lName.c_str());
                 functions[lName] = [&builders, &arrayReaders](const std::string &name)
                 {
@@ -219,6 +219,7 @@ int main(int argc, char **argv)
         }
     }
 
+    arrow::FieldVector fieldVec;
     // Finalize arrays
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     for (auto &builder : builders)
@@ -228,11 +229,12 @@ int main(int argc, char **argv)
         if (builders.find(brName + "L") == builders.end())
         {
             PARQUET_THROW_NOT_OK(builder.second->Finish(&array));
+            fieldVec.emplace_back(fields[brName]);
             arrays.emplace_back(array);
         }
     }
     // Generate schema from fields
-    auto schema = arrow::schema(fields);
+    auto schema = arrow::schema(fieldVec);
     // Create arrow::Table from finalized arrays
     auto table = arrow::Table::Make(schema, arrays);
 
