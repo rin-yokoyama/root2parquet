@@ -6,9 +6,11 @@ function(addExec exec_name)
     #target_include_directories(${exec_name} PRIVATE ${CMAKE_SOURCE_DIR}/sources/anacore)
     #target_link_directories(${exec_name} PUBLIC ${RDKAFKA_LIB_DIR})
     target_link_libraries(${exec_name} arrow parquet ${ROOT_LIBRARIES})
+    target_compile_options(${exec_name} PRIVATE -fpermissive)
 
     install(TARGETS ${exec_name}
         RUNTIME DESTINATION bin)
 endfunction()
 
 addExec(root2parquet)
+addExec(parquet2root)
