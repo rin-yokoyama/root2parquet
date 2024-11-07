@@ -96,6 +96,7 @@ int main(int argc, char **argv)
         {
             TLeaf *l = (TLeaf *)lvList->At(j);
             std::string lName = l->GetName();
+            std::string lTitle = l->GetTitle();
             std::string lType = l->GetTypeName();
             /**
              * Type specific procedure to fill tree entries to Apache arrow
@@ -105,58 +106,91 @@ int main(int argc, char **argv)
              * valueReaders[lName] = new TTreeReaderValue<type>(reader, lName.c_str()); : Create TTreeReaderValue for the branch
              * function[lName] =[](const std::string &name) {}; : Define a function to fill a branch entry to the arrow builder
              */
-            if (lType == "Double_t")
+	    if (lTitle == lName)
             {
-                builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
-                fields[lName] = (arrow::field(lName, arrow::float64()));
-                valueReaders[lName] = new TTreeReaderValue<Double_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &valueReaders](const std::string &name)
+                if (lType == "Double_t")
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::DoubleBuilder *>(builders[name].get())->Append(*((TTreeReaderValue<Double_t> *)valueReaders[name])->Get()));
-                };
-            }
-            else if (lType == "Float_t")
-            {
-                builders[lName] = std::make_shared<arrow::FloatBuilder>(pool);
-                fields[lName] = (arrow::field(lName, arrow::float32()));
-                valueReaders[lName] = new TTreeReaderValue<Float_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::float64()));
+                    valueReaders[lName] = new TTreeReaderValue<Double_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::DoubleBuilder *>(builders[name].get())->Append(*((TTreeReaderValue<Double_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "Float_t")
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::FloatBuilder *>(builders[name].get())->Append(*((TTreeReaderValue<Float_t> *)valueReaders[name])->Get()));
-                };
-            }
-            else if (lType == "Int_t")
-            {
-                builders[lName] = std::make_shared<arrow::Int32Builder>(pool);
-                fields[lName] = (arrow::field(lName, arrow::int32()));
-                valueReaders[lName] = new TTreeReaderValue<Int_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    builders[lName] = std::make_shared<arrow::FloatBuilder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::float32()));
+                    valueReaders[lName] = new TTreeReaderValue<Float_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::FloatBuilder *>(builders[name].get())->Append(*((TTreeReaderValue<Float_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "Int_t")
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::Int32Builder *>(builders[name].get())->Append(*((TTreeReaderValue<Int_t> *)valueReaders[name])->Get()));
-                };
-            }
-            else if (lType == "Long64_t")
-            {
-                builders[lName] = std::make_shared<arrow::Int64Builder>(pool);
-                fields[lName] = (arrow::field(lName, arrow::int64()));
-                valueReaders[lName] = new TTreeReaderValue<Long64_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    builders[lName] = std::make_shared<arrow::Int32Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::int32()));
+                    valueReaders[lName] = new TTreeReaderValue<Int_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int32Builder *>(builders[name].get())->Append(*((TTreeReaderValue<Int_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "Long64_t")
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::Int64Builder *>(builders[name].get())->Append(*((TTreeReaderValue<Long64_t> *)valueReaders[name])->Get()));
-                };
-            }
-            else if (lType == "ULong64_t")
-            {
-                builders[lName] = std::make_shared<arrow::UInt64Builder>(pool);
-                fields[lName] = (arrow::field(lName, arrow::uint64()));
-                valueReaders[lName] = new TTreeReaderValue<ULong64_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    builders[lName] = std::make_shared<arrow::Int64Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::int64()));
+                    valueReaders[lName] = new TTreeReaderValue<Long64_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int64Builder *>(builders[name].get())->Append(*((TTreeReaderValue<Long64_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "ULong64_t")
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::UInt64Builder *>(builders[name].get())->Append(*((TTreeReaderValue<ULong64_t> *)valueReaders[name])->Get()));
-                };
-            }
+                    builders[lName] = std::make_shared<arrow::UInt64Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::uint64()));
+                    valueReaders[lName] = new TTreeReaderValue<ULong64_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::UInt64Builder *>(builders[name].get())->Append(*((TTreeReaderValue<ULong64_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "Short_t")
+                {
+                    builders[lName] = std::make_shared<arrow::Int16Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::int16()));
+                    valueReaders[lName] = new TTreeReaderValue<Short_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int16Builder *>(builders[name].get())->Append(*((TTreeReaderValue<Short_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "UShort_t")
+                {
+                    builders[lName] = std::make_shared<arrow::UInt16Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::uint16()));
+                    valueReaders[lName] = new TTreeReaderValue<UShort_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::UInt16Builder *>(builders[name].get())->Append(*((TTreeReaderValue<UShort_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "Bool_t")
+                {
+                    builders[lName] = std::make_shared<arrow::BooleanBuilder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::boolean()));
+                    valueReaders[lName] = new TTreeReaderValue<Bool_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::BooleanBuilder *>(builders[name].get())->Append(*((TTreeReaderValue<Bool_t> *)valueReaders[name])->Get()));
+                    };
+                }
+	    }
             // Definitions for array types
-            else if (lType == "ROOT::VecOps::RVec<double>" || lType == "vector<double>")
+            if (lType == "ROOT::VecOps::RVec<double>" || lType == "vector<double>")
             {
                 builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
@@ -201,6 +235,7 @@ int main(int argc, char **argv)
                     }
                 };
             }
+
         }
     }
 
