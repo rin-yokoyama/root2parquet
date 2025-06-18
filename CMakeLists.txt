@@ -1,6 +1,6 @@
 # CMakeList.txt for the ROOTExamples project
 # CMake version 3 is required
-cmake_minimum_required (VERSION 3.0 FATAL_ERROR)
+cmake_minimum_required (VERSION 3.10 FATAL_ERROR)
 project(ROOTExamples CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -16,5 +16,6 @@ include(${ROOT_USE_FILE})
 # Set the default install prefix to [source_dir]/install
 # (You usually don't want to install this project to /usr/local/)
 set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/install CACHE PATH "install dir" FORCE)
+set(PAASS_DIR "$ENV{PAASSSYS}" CACHE PATH "Paass install dir")
 
 add_subdirectory(sources)
