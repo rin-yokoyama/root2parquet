@@ -98,6 +98,8 @@ int main(int argc, char **argv)
             std::string lName = l->GetName();
             std::string lTitle = l->GetTitle();
             std::string lType = l->GetTypeName();
+	    bool isArray = lTitle.find("[") != std::string::npos;
+	    std::cout << "Branch Name: " << lTitle <<", Type: " << lType << ", isArray: " << isArray << std::endl;
             /**
              * Type specific procedure to fill tree entries to Apache arrow
              *
@@ -106,7 +108,7 @@ int main(int argc, char **argv)
              * valueReaders[lName] = new TTreeReaderValue<type>(reader, lName.c_str()); : Create TTreeReaderValue for the branch
              * function[lName] =[](const std::string &name) {}; : Define a function to fill a branch entry to the arrow builder
              */
-	    if (lTitle == lName)
+	    if (lTitle == lName && !isArray)
             {
                 if (lType == "Double_t")
                 {
@@ -190,7 +192,7 @@ int main(int argc, char **argv)
                 }
 	    }
             // Definitions for array types
-            if (lType == "ROOT::VecOps::RVec<double>" || lType == "vector<double>")
+            if (lType == "ROOT::VecOps::RVec<double>" || lType == "vector<double>" || (isArray && lType == "Double_t"))
             {
                 builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
@@ -205,7 +207,7 @@ int main(int argc, char **argv)
                     }
                 };
             }
-            else if (lType == "ROOT::VecOps::RVec<float>" || lType == "vector<float>")
+            else if (lType == "ROOT::VecOps::RVec<float>" || lType == "vector<float>"  || (isArray && lType == "Float_t"))
             {
                 builders[lName] = std::make_shared<arrow::FloatBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
@@ -220,7 +222,7 @@ int main(int argc, char **argv)
                     }
                 };
             }
-            else if (lType == "ROOT::VecOps::RVec<int>" || lType == "vector<int>")
+            else if (lType == "ROOT::VecOps::RVec<int>" || lType == "vector<int>" || (isArray && lType == "Int_t"))
             {
                 builders[lName] = std::make_shared<arrow::Int32Builder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
@@ -235,7 +237,36 @@ int main(int argc, char **argv)
                     }
                 };
             }
-
+            else if (lType == "ROOT::VecOps::RVec<short>" || lType == "vector<short>" || (isArray && lType == "Short_t"))
+            {
+                builders[lName] = std::make_shared<arrow::Int16Builder>(pool);
+                builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
+                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::int16())));
+                arrayReaders[lName] = new TTreeReaderArray<Short_t>(reader, lName.c_str());
+                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                {
+                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                    for (auto &v : *(TTreeReaderArray<Short_t> *)arrayReaders[name])
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int16Builder *>(builders[name].get())->Append(v));
+                    }
+                };
+            }
+            else if (lType == "ROOT::VecOps::RVec<int64_t>" || lType == "vector<int64_t>" || (isArray && lType == "Long64_t"))
+            {
+                builders[lName] = std::make_shared<arrow::Int64Builder>(pool);
+                builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
+                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::int64())));
+                arrayReaders[lName] = new TTreeReaderArray<Long64_t>(reader, lName.c_str());
+                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                {
+                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                    for (auto &v : *(TTreeReaderArray<Long64_t> *)arrayReaders[name])
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int64Builder *>(builders[name].get())->Append(v));
+                    }
+                };
+            }
         }
     }
 
