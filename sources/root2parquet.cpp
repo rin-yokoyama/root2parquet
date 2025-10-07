@@ -11,6 +11,8 @@
 #include <iostream>
 #include <map>
 #include <functional>
+#include <string>
+#include <algorithm>
 #include "TROOT.h"
 #include "TFile.h"
 #include "TTreeReader.h"
@@ -30,6 +32,49 @@ void usage(char *argv0)
               << "-t [input_tree_name] (default: tree)"
               << "-o [output_file_name] (default: [input_ridf_file_name].parquet)"
               << std::endl;
+}
+
+/** Helper function to parse array information from leaf title */
+struct ArrayInfo
+{
+    bool isArray = false;
+    bool isFixedSize = false;
+    int fixedSize = 0;
+    std::string sizeBranch = "";
+    std::string baseName = "";
+};
+
+ArrayInfo parseArrayInfo(const std::string &leafTitle, const std::string &leafName)
+{
+    ArrayInfo info;
+    info.baseName = leafName;
+
+    size_t bracketStart = leafTitle.find('[');
+    if (bracketStart != std::string::npos)
+    {
+        info.isArray = true;
+        size_t bracketEnd = leafTitle.find(']', bracketStart);
+        if (bracketEnd != std::string::npos)
+        {
+            std::string sizeStr = leafTitle.substr(bracketStart + 1, bracketEnd - bracketStart - 1);
+
+            // Try to parse as integer (fixed size array)
+            try
+            {
+                info.fixedSize = std::stoi(sizeStr);
+                info.isFixedSize = true;
+                std::cout << "Fixed size array: " << leafName << " with size " << info.fixedSize << std::endl;
+            }
+            catch (const std::exception &)
+            {
+                // Not a number, assume it's a variable name
+                info.sizeBranch = sizeStr;
+                info.isFixedSize = false;
+                std::cout << "Variable size array: " << leafName << " with size branch " << info.sizeBranch << std::endl;
+            }
+        }
+    }
+    return info;
 }
 
 // Main function
@@ -80,6 +125,9 @@ int main(int argc, char **argv)
     // Map of ROOT TTreeReaderValues and Arrays
     std::map<std::string, ROOT::Internal::TTreeReaderArrayBase *> arrayReaders;
     std::map<std::string, ROOT::Internal::TTreeReaderValueBase *> valueReaders;
+    // Map to store array size information
+    std::map<std::string, std::string> arraySizeBranches; // maps array name to size branch name
+    std::map<std::string, int> fixedArraySizes;           // maps array name to fixed size
 
     // Open input ROOT file
     TFile rfile(input_file_name.c_str());
@@ -98,8 +146,34 @@ int main(int argc, char **argv)
             std::string lName = l->GetName();
             std::string lTitle = l->GetTitle();
             std::string lType = l->GetTypeName();
-	    bool isArray = lTitle.find("[") != std::string::npos;
-	    std::cout << "Branch Name: " << lTitle <<", Type: " << lType << ", isArray: " << isArray << std::endl;
+
+            ArrayInfo arrayInfo = parseArrayInfo(lTitle, lName);
+            std::cout << "Branch Name: " << lTitle << ", Type: " << lType << ", isArray: " << arrayInfo.isArray;
+            if (arrayInfo.isArray)
+            {
+                if (arrayInfo.isFixedSize)
+                {
+                    std::cout << " (fixed size: " << arrayInfo.fixedSize << ")";
+                }
+                else
+                {
+                    std::cout << " (variable size, controlled by: " << arrayInfo.sizeBranch << ")";
+                }
+            }
+            std::cout << std::endl;
+
+            // Store array information for later use
+            if (arrayInfo.isArray)
+            {
+                if (arrayInfo.isFixedSize)
+                {
+                    fixedArraySizes[lName] = arrayInfo.fixedSize;
+                }
+                else
+                {
+                    arraySizeBranches[lName] = arrayInfo.sizeBranch;
+                }
+            }
             /**
              * Type specific procedure to fill tree entries to Apache arrow
              *
@@ -108,7 +182,7 @@ int main(int argc, char **argv)
              * valueReaders[lName] = new TTreeReaderValue<type>(reader, lName.c_str()); : Create TTreeReaderValue for the branch
              * function[lName] =[](const std::string &name) {}; : Define a function to fill a branch entry to the arrow builder
              */
-	    if (lTitle == lName && !isArray)
+            if (lTitle == lName && !arrayInfo.isArray)
             {
                 if (lType == "Double_t")
                 {
@@ -190,100 +264,399 @@ int main(int argc, char **argv)
                         PARQUET_THROW_NOT_OK(static_cast<arrow::BooleanBuilder *>(builders[name].get())->Append(*((TTreeReaderValue<Bool_t> *)valueReaders[name])->Get()));
                     };
                 }
-	    }
-            // Definitions for array types
-            if (lType == "ROOT::VecOps::RVec<double>" || lType == "vector<double>" || (isArray && lType == "Double_t"))
+                else if (lType == "UInt_t")
+                {
+                    builders[lName] = std::make_shared<arrow::UInt32Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::uint32()));
+                    valueReaders[lName] = new TTreeReaderValue<UInt_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::UInt32Builder *>(builders[name].get())->Append(*((TTreeReaderValue<UInt_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "Char_t")
+                {
+                    builders[lName] = std::make_shared<arrow::Int8Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::int8()));
+                    valueReaders[lName] = new TTreeReaderValue<Char_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int8Builder *>(builders[name].get())->Append(*((TTreeReaderValue<Char_t> *)valueReaders[name])->Get()));
+                    };
+                }
+                else if (lType == "UChar_t")
+                {
+                    builders[lName] = std::make_shared<arrow::UInt8Builder>(pool);
+                    fields[lName] = (arrow::field(lName, arrow::uint8()));
+                    valueReaders[lName] = new TTreeReaderValue<UChar_t>(reader, lName.c_str());
+                    functions[lName] = [&builders, &valueReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::UInt8Builder *>(builders[name].get())->Append(*((TTreeReaderValue<UChar_t> *)valueReaders[name])->Get()));
+                    };
+                }
+            }
+            // Definitions for array types (improved handling for different array formats)
+            if (lType == "ROOT::VecOps::RVec<double>" || lType == "vector<double>" || (arrayInfo.isArray && lType == "Double_t"))
             {
                 builders[lName] = std::make_shared<arrow::DoubleBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::float64())));
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::float64())));
                 arrayReaders[lName] = new TTreeReaderArray<Double_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+
+                // Enhanced function to handle different array types
+                if (arrayInfo.isFixedSize)
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
-                    for (auto &v : *(TTreeReaderArray<Double_t> *)arrayReaders[name])
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
                     {
-                        PARQUET_THROW_NOT_OK(static_cast<arrow::DoubleBuilder *>(builders[name].get())->Append(v));
-                    }
-                };
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<Double_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize); // Use the smaller size for safety
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::DoubleBuilder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<Double_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::DoubleBuilder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
             }
-            else if (lType == "ROOT::VecOps::RVec<float>" || lType == "vector<float>"  || (isArray && lType == "Float_t"))
+            else if (lType == "ROOT::VecOps::RVec<float>" || lType == "vector<float>" || (arrayInfo.isArray && lType == "Float_t"))
             {
                 builders[lName] = std::make_shared<arrow::FloatBuilder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::float32())));
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::float32())));
                 arrayReaders[lName] = new TTreeReaderArray<Float_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+
+                if (arrayInfo.isFixedSize)
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
-                    for (auto &v : *(TTreeReaderArray<Float_t> *)arrayReaders[name])
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
                     {
-                        PARQUET_THROW_NOT_OK(static_cast<arrow::FloatBuilder *>(builders[name].get())->Append(v));
-                    }
-                };
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<Float_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::FloatBuilder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<Float_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::FloatBuilder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
             }
-            else if (lType == "ROOT::VecOps::RVec<int>" || lType == "vector<int>" || (isArray && lType == "Int_t"))
+            else if (lType == "ROOT::VecOps::RVec<int>" || lType == "vector<int>" || (arrayInfo.isArray && lType == "Int_t"))
             {
                 builders[lName] = std::make_shared<arrow::Int32Builder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::int32())));
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::int32())));
                 arrayReaders[lName] = new TTreeReaderArray<Int_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+
+                if (arrayInfo.isFixedSize)
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
-                    for (auto &v : *(TTreeReaderArray<Int_t> *)arrayReaders[name])
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
                     {
-                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int32Builder *>(builders[name].get())->Append(v));
-                    }
-                };
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<Int_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::Int32Builder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<Int_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::Int32Builder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
             }
-            else if (lType == "ROOT::VecOps::RVec<short>" || lType == "vector<short>" || (isArray && lType == "Short_t"))
+            else if (lType == "ROOT::VecOps::RVec<short>" || lType == "vector<short>" || (arrayInfo.isArray && lType == "Short_t"))
             {
                 builders[lName] = std::make_shared<arrow::Int16Builder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::int16())));
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::int16())));
                 arrayReaders[lName] = new TTreeReaderArray<Short_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+
+                if (arrayInfo.isFixedSize)
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
-                    for (auto &v : *(TTreeReaderArray<Short_t> *)arrayReaders[name])
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
                     {
-                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int16Builder *>(builders[name].get())->Append(v));
-                    }
-                };
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<Short_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::Int16Builder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<Short_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::Int16Builder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
             }
-            else if (lType == "ROOT::VecOps::RVec<int64_t>" || lType == "vector<int64_t>" || (isArray && lType == "Long64_t"))
+            else if (lType == "ROOT::VecOps::RVec<int64_t>" || lType == "vector<int64_t>" || (arrayInfo.isArray && lType == "Long64_t"))
             {
                 builders[lName] = std::make_shared<arrow::Int64Builder>(pool);
                 builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
-                fields[lName] = (arrow::field(lName + "L", arrow::list(arrow::int64())));
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::int64())));
                 arrayReaders[lName] = new TTreeReaderArray<Long64_t>(reader, lName.c_str());
-                functions[lName] = [&builders, &arrayReaders](const std::string &name)
+
+                if (arrayInfo.isFixedSize)
                 {
-                    PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
-                    for (auto &v : *(TTreeReaderArray<Long64_t> *)arrayReaders[name])
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
                     {
-                        PARQUET_THROW_NOT_OK(static_cast<arrow::Int64Builder *>(builders[name].get())->Append(v));
-                    }
-                };
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<Long64_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::Int64Builder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<Long64_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::Int64Builder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
+            }
+            else if (lType == "ROOT::VecOps::RVec<unsigned int>" || lType == "vector<unsigned int>" || (arrayInfo.isArray && lType == "UInt_t"))
+            {
+                builders[lName] = std::make_shared<arrow::UInt32Builder>(pool);
+                builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::uint32())));
+                arrayReaders[lName] = new TTreeReaderArray<UInt_t>(reader, lName.c_str());
+
+                if (arrayInfo.isFixedSize)
+                {
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<UInt_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::UInt32Builder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<UInt_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::UInt32Builder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
+            }
+            else if (lType == "ROOT::VecOps::RVec<uint64_t>" || lType == "vector<uint64_t>" || (arrayInfo.isArray && lType == "ULong64_t"))
+            {
+                builders[lName] = std::make_shared<arrow::UInt64Builder>(pool);
+                builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::uint64())));
+                arrayReaders[lName] = new TTreeReaderArray<ULong64_t>(reader, lName.c_str());
+
+                if (arrayInfo.isFixedSize)
+                {
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<ULong64_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::UInt64Builder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<ULong64_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::UInt64Builder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
+            }
+            else if (lType == "ROOT::VecOps::RVec<unsigned short>" || lType == "vector<unsigned short>" || (arrayInfo.isArray && lType == "UShort_t"))
+            {
+                builders[lName] = std::make_shared<arrow::UInt16Builder>(pool);
+                builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::uint16())));
+                arrayReaders[lName] = new TTreeReaderArray<UShort_t>(reader, lName.c_str());
+
+                if (arrayInfo.isFixedSize)
+                {
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<UShort_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::UInt16Builder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<UShort_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::UInt16Builder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
+            }
+            else if (lType == "ROOT::VecOps::RVec<bool>" || lType == "vector<bool>" || (arrayInfo.isArray && lType == "Bool_t"))
+            {
+                builders[lName] = std::make_shared<arrow::BooleanBuilder>(pool);
+                builders[lName + "L"] = std::make_shared<arrow::ListBuilder>(pool, builders[lName]);
+                fields[lName + "L"] = (arrow::field(lName, arrow::list(arrow::boolean())));
+                arrayReaders[lName] = new TTreeReaderArray<Bool_t>(reader, lName.c_str());
+
+                if (arrayInfo.isFixedSize)
+                {
+                    functions[lName] = [&builders, &arrayReaders, &fixedArraySizes](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        auto *array = (TTreeReaderArray<Bool_t> *)arrayReaders[name];
+                        int expectedSize = fixedArraySizes[name];
+                        int actualSize = array->GetSize();
+                        int size = std::min(expectedSize, actualSize);
+                        for (int i = 0; i < size; ++i)
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::BooleanBuilder *>(builders[name].get())->Append((*array)[i]));
+                        }
+                    };
+                }
+                else
+                {
+                    functions[lName] = [&builders, &arrayReaders](const std::string &name)
+                    {
+                        PARQUET_THROW_NOT_OK(static_cast<arrow::ListBuilder *>(builders[name + "L"].get())->Append());
+                        for (auto &v : *(TTreeReaderArray<Bool_t> *)arrayReaders[name])
+                        {
+                            PARQUET_THROW_NOT_OK(static_cast<arrow::BooleanBuilder *>(builders[name].get())->Append(v));
+                        }
+                    };
+                }
             }
         }
     }
 
+    // Print array size information summary
+    std::cout << "\nArray size information summary:" << std::endl;
+    for (const auto &pair : fixedArraySizes)
+    {
+        std::cout << "  " << pair.first << ": fixed size array [" << pair.second << "]" << std::endl;
+    }
+    for (const auto &pair : arraySizeBranches)
+    {
+        std::cout << "  " << pair.first << ": variable size array, controlled by branch '" << pair.second << "'" << std::endl;
+        // Check if the size branch exists
+        bool sizeBranchFound = false;
+        for (const auto &vr : valueReaders)
+        {
+            if (vr.first == pair.second)
+            {
+                sizeBranchFound = true;
+                break;
+            }
+        }
+        if (!sizeBranchFound)
+        {
+            std::cout << "    WARNING: Size branch '" << pair.second << "' not found in scalar branches!" << std::endl;
+        }
+    }
+    std::cout << std::endl;
+
     // Event loop
+    long long eventCount = 0;
     while (reader.Next())
     {
+        // Fill scalar values first (including size variables)
         for (auto &r : valueReaders)
         {
             std::string brName = r.first;
             functions[brName](brName);
         }
+
+        // Then fill arrays (they may depend on size variables)
         for (auto &r : arrayReaders)
         {
             std::string brName = r.first;
             functions[brName](brName);
         }
+
+        eventCount++;
+        if (eventCount % 10000 == 0)
+        {
+            std::cout << "Processed " << eventCount << " events..." << std::endl;
+        }
     }
+    std::cout << "Total events processed: " << eventCount << std::endl;
 
     arrow::FieldVector fieldVec;
     // Finalize arrays
