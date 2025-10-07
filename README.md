@@ -1,9 +1,14 @@
 # root2parquet
+- root2parquet: 
 Converts a simple ROOT TTree to a Apache parquet file.
+- parquet2root:
+Converts a simple parquet to ROOT TTree
 
 ## Requirements
 - Cern ROOT
 - Apache Arrow, Parquet
+
+
 For Ubuntu 22.04
 ```
 sudo apt update
@@ -23,13 +28,16 @@ cd build
 cmake ..
 make
 ```
+Requires the `$ROOTSYS` environment
 
 ## Usage
 ```
 root2parquet -i [input_root_file_name]
--t [input_tree_name] (default: tree) -o [output_file_name] (default: [input_ridf_file_name].parquet)
+-t [input_tree_name] (default: tree) -o [output_file_name] (default: [input_root_file_name].parquet)
+parquet2root -i [input_parquet_file_name]
+-o [output_file_name] (default: [input_parquet_file_name].root)
 ```
-
+parquet2root assumes a directory for the input. If you have a single parquet file, put it in a directory ends with .parquet and provide it as an input.
 
 ## Supported Data Types
 - `Double_t`
@@ -37,9 +45,13 @@ root2parquet -i [input_root_file_name]
 - `Int_t`
 - `Long64_t`
 - `ULong64_t`
-- `ROOT::VecOps::RVec<int>`, `vector<int>`
-- `ROOT::VecOps::RVec<float>`, `vector<float>`
-- `ROOT::VecOps::RVec<double>`, `vector<double>`
+- `Short_t`
+- `UShort_t`
+- `Bool_t`
+- `UInt_t`
+- `Char_t`
+- `UChar_t`
+- `ROOT::VecOps::RVec`, `std::vector`, or 1d arrays (`[]`), of types above
 
 Add else if statements to the root2parquet.cpp to support more data types
 ```
