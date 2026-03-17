@@ -64,7 +64,10 @@ void ConvertParquetToRoot(const std::string &parquet_filename, const std::string
 
             // Open Parquet file reader
             std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
-            ARROW_ASSIGN_OR_RAISE(arrow_reader, parquet::arrow::OpenFile(input, pool));
+            parquet::arrow::FileReaderBuilder reader_builder;
+            ARROW_RETURN_NOT_OK(reader_builder.OpenFile(filename));
+            reader_builder.memory_pool(pool);
+            ARROW_ASSIGN_OR_RAISE(arrow_reader, reader_builder.Build());
 
             // Read entire file as a single Arrow table
             std::shared_ptr<arrow::Table> table;

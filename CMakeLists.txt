@@ -1,6 +1,6 @@
 # CMakeList.txt for the ROOTExamples project
 # CMake version 3 is required
-cmake_minimum_required (VERSION 3.0 FATAL_ERROR)
+cmake_minimum_required (VERSION 3.5 FATAL_ERROR)
 project(ROOTExamples CXX)
 
 # Add in CMAKE_PREFIX_PATH the installation prefix for ROOT 
