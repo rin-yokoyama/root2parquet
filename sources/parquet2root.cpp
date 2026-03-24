@@ -5,6 +5,10 @@
 #include <TFile.h>
 #include <TTree.h>
 #include <TROOT.h>
+#include <arrow/type.h>
+#include <arrow/type_fwd.h>
+#include <sstream>
+
 #include <iostream>
 #include <filesystem>
 #include <vector>
@@ -17,9 +21,9 @@
 #include <condition_variable>
 #include <functional>
 #include <atomic>
-
-// Global mutex for protecting ROOT operations (not thread-safe by default)
-std::mutex root_mutex;
+#include <stdexcept>
+#include <cstdint>
+#include <unistd.h>
 
 // Thread Pool for managing worker threads
 class ThreadPool
@@ -30,6 +34,7 @@ private:
     std::mutex queue_mutex;
     std::condition_variable condition;
     std::atomic<bool> stop{false};
+    std::atomic<size_t> active_tasks{0};
 
     void worker_thread()
     {
@@ -48,11 +53,31 @@ private:
                 {
                     task = std::move(tasks.front());
                     tasks.pop();
+                    active_tasks++;
                 }
             }
 
             if (task)
+            {
                 task();
+                active_tasks--;
+
+                bool has_more_work = false;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    if (!tasks.empty())
+                    {
+                        has_more_work = true;
+                    }
+                    else if (active_tasks == 0)
+                    {
+                        condition.notify_all();
+                    }
+                }
+
+                if (has_more_work)
+                    continue;
+            }
         }
     }
 
@@ -69,8 +94,10 @@ public:
         std::cout << "Creating thread pool with " << num_threads << " threads" << std::endl;
 
         for (size_t i = 0; i < num_threads; ++i)
-            workers.emplace_back([this]
+        {
+            workers.emplace_back([this]()
                                  { worker_thread(); });
+        }
     }
 
     ~ThreadPool()
@@ -78,35 +105,36 @@ public:
         stop = true;
         condition.notify_all();
         for (auto &worker : workers)
+        {
             if (worker.joinable())
                 worker.join();
+        }
     }
 
     void enqueue(std::function<void()> task)
     {
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            tasks.push(task);
+            tasks.push(std::move(task));
         }
-        condition.notify_one();
+        condition.notify_all();
     }
 
     void wait_for_completion()
     {
         std::unique_lock<std::mutex> lock(queue_mutex);
         condition.wait(lock, [this]
-                       { return tasks.empty(); });
+                       { return tasks.empty() && active_tasks == 0; });
     }
 };
 
-// Helper struct for Arrow table data and metadata (for thread-safe passing)
+// Helper struct for Arrow table data and metadata
 struct ParquetData
 {
     std::shared_ptr<arrow::Table> table;
     std::map<int, arrow::Type::type> column_types;
 };
 
-// Function to safely read Arrow Parquet data (no ROOT operations, fully parallelizable)
 ParquetData ReadParquetFile(const std::string &parquet_filename)
 {
     ParquetData result;
@@ -114,29 +142,28 @@ ParquetData ReadParquetFile(const std::string &parquet_filename)
     try
     {
         arrow::MemoryPool *pool = arrow::default_memory_pool();
-        std::shared_ptr<arrow::io::RandomAccessFile> input;
+
         auto status_input = arrow::io::ReadableFile::Open(parquet_filename);
         if (!status_input.ok())
         {
             throw std::runtime_error("Failed to open parquet file: " + status_input.status().message());
         }
-        input = std::move(status_input.ValueOrDie());
+        std::shared_ptr<arrow::io::RandomAccessFile> input = status_input.ValueOrDie();
 
-        std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
         parquet::arrow::FileReaderBuilder reader_builder;
         reader_builder.memory_pool(pool);
+
         auto status_open = reader_builder.Open(input);
         if (!status_open.ok())
         {
             throw std::runtime_error("Failed to open parquet reader: " + status_open.message());
         }
-
         auto status_build = reader_builder.Build();
         if (!status_build.ok())
         {
             throw std::runtime_error("Failed to build parquet reader: " + status_build.status().message());
         }
-        arrow_reader = std::move(status_build.ValueOrDie());
+        std::unique_ptr<parquet::arrow::FileReader> arrow_reader = std::move(status_build).ValueOrDie();
 
         auto status_table = arrow_reader->ReadTable(&result.table);
         if (!status_table.ok())
@@ -144,7 +171,6 @@ ParquetData ReadParquetFile(const std::string &parquet_filename)
             throw std::runtime_error("Failed to read table: " + status_table.message());
         }
 
-        // Store column types
         for (int i = 0; i < result.table->num_columns(); ++i)
         {
             result.column_types[i] = result.table->column(i)->type()->id();
@@ -152,14 +178,14 @@ ParquetData ReadParquetFile(const std::string &parquet_filename)
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Error reading parquet file: " << e.what() << std::endl;
+        std::cerr << "Error reading parquet file " << parquet_filename << ": " << e.what() << std::endl;
         result.table = nullptr;
     }
 
     return result;
 }
 
-// Function to convert Arrow table to ROOT file (needs ROOT mutex)
+// NOTE: global ROOT mutex removed for testing
 void WriteRootFile(const std::string &root_filename, const ParquetData &parquet_data)
 {
     if (!parquet_data.table)
@@ -168,17 +194,19 @@ void WriteRootFile(const std::string &root_filename, const ParquetData &parquet_
         return;
     }
 
-    std::unique_lock<std::mutex> root_lock(root_mutex);
-
     try
     {
         TFile root_file(root_filename.c_str(), "RECREATE");
+        if (root_file.IsZombie())
+        {
+            throw std::runtime_error("Failed to create ROOT file");
+        }
+
         TTree tree("tree", "Converted Parquet Data");
 
         auto &table = parquet_data.table;
         auto &column_types = parquet_data.column_types;
 
-        // Data containers for scalar columns
         std::vector<float> float_columns(table->num_columns());
         std::vector<double> double_columns(table->num_columns());
         std::vector<int> int_columns(table->num_columns());
@@ -188,8 +216,8 @@ void WriteRootFile(const std::string &root_filename, const ParquetData &parquet_
         std::vector<uint32_t> uint_columns(table->num_columns());
         std::vector<uint16_t> ushort_columns(table->num_columns());
         std::vector<char> bool_columns(table->num_columns());
+        std::vector<std::string> string_columns(table->num_columns());
 
-        // Data containers for array columns
         struct ArrayColumn
         {
             arrow::Type::type element_type;
@@ -197,331 +225,331 @@ void WriteRootFile(const std::string &root_filename, const ParquetData &parquet_
             std::vector<double> double_array;
             std::vector<int> int_array;
             std::vector<int16_t> short_array;
-            std::vector<int64_t> long_array;
+            std::vector<uint64_t> ull_array;
+            std::vector<int64_t> ll_array;
             std::vector<uint32_t> uint_array;
             std::vector<uint16_t> ushort_array;
-            std::vector<uint64_t> ulong_array;
             std::vector<char> bool_array;
-            int array_size;
-            std::string branch_spec;
+            std::vector<std::string> string_array;
+            // for decimal arrays such as decimal(21,10), stored in ROOT as doubles
+            int32_t decimal_scale = 0;
+            int32_t decimal_precision = 0;
         };
 
         std::map<int, ArrayColumn> array_columns;
 
-        // Create branches based on schema
-        for (int i = 0; i < table->num_columns(); ++i)
+        for (int col = 0; col < table->num_columns(); ++col)
         {
-            auto column = table->column(i);
-            auto column_name = table->schema()->field(i)->name();
-            auto column_type = column->type();
+            std::string col_name = table->schema()->field(col)->name();
+            auto col_type = column_types.at(col);
 
-            if (column_type->id() == arrow::Type::LIST)
+            if (col_type == arrow::Type::LIST)
             {
-                auto list_type = std::static_pointer_cast<arrow::ListType>(column_type);
-                auto element_type = list_type->value_type();
+                auto list_type = std::static_pointer_cast<arrow::ListType>(table->column(col)->type());
+                auto value_type = list_type->value_type();
+                auto element_type = value_type->id();
 
-                ArrayColumn array_col;
-                array_col.element_type = element_type->id();
+                ArrayColumn arr_col;
+                arr_col.element_type = element_type;
 
-                // Determine max array size
-                int max_size = 0;
-                for (int chunk_idx = 0; chunk_idx < column->num_chunks(); ++chunk_idx)
-                {
-                    auto list_array = std::static_pointer_cast<arrow::ListArray>(column->chunk(chunk_idx));
-                    for (int64_t row = 0; row < list_array->length(); ++row)
-                    {
-                        if (!list_array->IsNull(row))
-                        {
-                            int size = list_array->value_length(row);
-                            max_size = std::max(max_size, size);
-                        }
-                    }
-                }
-
-                array_col.array_size = std::max(max_size, 1);
-
-                switch (element_type->id())
+                switch (element_type)
                 {
                 case arrow::Type::FLOAT:
-                    array_col.float_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/F";
-                    tree.Branch(column_name.c_str(), array_col.float_array.data(), array_col.branch_spec.c_str());
+                    tree.Branch(col_name.c_str(), &arr_col.float_array);
                     break;
                 case arrow::Type::DOUBLE:
-                    array_col.double_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/D";
-                    tree.Branch(column_name.c_str(), array_col.double_array.data(), array_col.branch_spec.c_str());
+                    tree.Branch(col_name.c_str(), &arr_col.double_array);
                     break;
                 case arrow::Type::INT32:
-                    array_col.int_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/I";
-                    tree.Branch(column_name.c_str(), array_col.int_array.data(), array_col.branch_spec.c_str());
+                    tree.Branch(col_name.c_str(), &arr_col.int_array);
                     break;
                 case arrow::Type::INT16:
-                    array_col.short_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/S";
-                    tree.Branch(column_name.c_str(), array_col.short_array.data(), array_col.branch_spec.c_str());
-                    break;
-                case arrow::Type::INT64:
-                    array_col.long_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/L";
-                    tree.Branch(column_name.c_str(), array_col.long_array.data(), array_col.branch_spec.c_str());
-                    break;
-                case arrow::Type::UINT32:
-                    array_col.uint_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/i";
-                    tree.Branch(column_name.c_str(), array_col.uint_array.data(), array_col.branch_spec.c_str());
-                    break;
-                case arrow::Type::UINT16:
-                    array_col.ushort_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/s";
-                    tree.Branch(column_name.c_str(), array_col.ushort_array.data(), array_col.branch_spec.c_str());
+                    tree.Branch(col_name.c_str(), &arr_col.short_array);
                     break;
                 case arrow::Type::UINT64:
-                    array_col.ulong_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/l";
-                    tree.Branch(column_name.c_str(), array_col.ulong_array.data(), array_col.branch_spec.c_str());
+                    tree.Branch(col_name.c_str(), &arr_col.ull_array);
+                    break;
+                case arrow::Type::INT64:
+                    tree.Branch(col_name.c_str(), &arr_col.ll_array);
+                    break;
+                case arrow::Type::UINT32:
+                    tree.Branch(col_name.c_str(), &arr_col.uint_array);
+                    break;
+                case arrow::Type::UINT16:
+                    tree.Branch(col_name.c_str(), &arr_col.ushort_array);
                     break;
                 case arrow::Type::BOOL:
-                    array_col.bool_array.resize(array_col.array_size);
-                    array_col.branch_spec = column_name + "[" + std::to_string(array_col.array_size) + "]/B";
-                    tree.Branch(column_name.c_str(), array_col.bool_array.data(), array_col.branch_spec.c_str());
+                    tree.Branch(col_name.c_str(), &arr_col.bool_array);
                     break;
+                case arrow::Type::STRING:
+                    tree.Branch(col_name.c_str(), &arr_col.string_array);
+                    break;
+                case arrow::Type::DECIMAL128:
+                {
+                    auto dec_type = std::static_pointer_cast<arrow::Decimal128Type>(value_type);
+                    arr_col.decimal_scale = dec_type->scale();
+                    arr_col.decimal_precision = dec_type->precision();
+
+                    // store decimal array in ROOT as vector<double>
+                    tree.Branch(col_name.c_str(), &arr_col.double_array);
+                    break;
+                }
                 default:
-                    continue;
+                    std::cerr << "Unsupported list element type for column "
+                              << col_name << " : " << value_type->ToString() << std::endl;
+                    break;
                 }
 
-                array_columns[i] = array_col;
+                array_columns[col] = std::move(arr_col);
             }
             else
             {
-                // Handle scalar columns
-                switch (column_type->id())
+                switch (col_type)
                 {
                 case arrow::Type::FLOAT:
-                    tree.Branch(column_name.c_str(), &float_columns[i]);
+                    tree.Branch(col_name.c_str(), &float_columns[col]);
                     break;
                 case arrow::Type::DOUBLE:
-                    tree.Branch(column_name.c_str(), &double_columns[i]);
+                    tree.Branch(col_name.c_str(), &double_columns[col]);
                     break;
                 case arrow::Type::INT32:
-                    tree.Branch(column_name.c_str(), &int_columns[i]);
+                    tree.Branch(col_name.c_str(), &int_columns[col]);
                     break;
                 case arrow::Type::INT16:
-                    tree.Branch(column_name.c_str(), &short_columns[i]);
-                    break;
-                case arrow::Type::INT64:
-                    tree.Branch(column_name.c_str(), &ll_columns[i]);
-                    break;
-                case arrow::Type::UINT32:
-                    tree.Branch(column_name.c_str(), &uint_columns[i]);
-                    break;
-                case arrow::Type::UINT16:
-                    tree.Branch(column_name.c_str(), &ushort_columns[i]);
+                    tree.Branch(col_name.c_str(), &short_columns[col]);
                     break;
                 case arrow::Type::UINT64:
-                    tree.Branch(column_name.c_str(), &ull_columns[i]);
+                    tree.Branch(col_name.c_str(), &ull_columns[col]);
+                    break;
+                case arrow::Type::INT64:
+                    tree.Branch(col_name.c_str(), &ll_columns[col]);
+                    break;
+                case arrow::Type::UINT32:
+                    tree.Branch(col_name.c_str(), &uint_columns[col]);
+                    break;
+                case arrow::Type::UINT16:
+                    tree.Branch(col_name.c_str(), &ushort_columns[col]);
                     break;
                 case arrow::Type::BOOL:
-                    tree.Branch(column_name.c_str(), &bool_columns[i], (column_name + "/B").c_str());
+                    tree.Branch(col_name.c_str(), &bool_columns[col]);
+                    break;
+                case arrow::Type::STRING:
+                    tree.Branch(col_name.c_str(), &string_columns[col]);
                     break;
                 default:
+                    std::cerr << "Unsupported scalar type for column "
+                              << col_name << " : "
+                              << table->column(col)->type()->ToString() << std::endl;
                     break;
                 }
             }
         }
 
-        // Fill the TTree with data
-        for (int row = 0; row < table->num_rows(); ++row)
+        for (int64_t row = 0; row < table->num_rows(); ++row)
         {
             for (int col = 0; col < table->num_columns(); ++col)
             {
-                auto column_type = column_types.at(col);
+                auto col_type = column_types.at(col);
 
-                if (column_type == arrow::Type::LIST)
+                if (col_type == arrow::Type::LIST)
                 {
-                    if (array_columns.find(col) != array_columns.end())
-                    {
-                        auto &array_col = array_columns[col];
-                        auto list_array = std::static_pointer_cast<arrow::ListArray>(table->column(col)->chunk(0));
+                    auto list_array = std::static_pointer_cast<arrow::ListArray>(table->column(col)->chunk(0));
+                    auto &arr_col = array_columns[col];
 
-                        // Clear previous values
-                        switch (array_col.element_type)
-                        {
-                        case arrow::Type::FLOAT:
-                            std::fill(array_col.float_array.begin(), array_col.float_array.end(), 0.0f);
-                            break;
-                        case arrow::Type::DOUBLE:
-                            std::fill(array_col.double_array.begin(), array_col.double_array.end(), 0.0);
-                            break;
-                        case arrow::Type::INT32:
-                            std::fill(array_col.int_array.begin(), array_col.int_array.end(), 0);
-                            break;
-                        case arrow::Type::INT16:
-                            std::fill(array_col.short_array.begin(), array_col.short_array.end(), 0);
-                            break;
-                        case arrow::Type::INT64:
-                            std::fill(array_col.long_array.begin(), array_col.long_array.end(), 0);
-                            break;
-                        case arrow::Type::UINT32:
-                            std::fill(array_col.uint_array.begin(), array_col.uint_array.end(), 0);
-                            break;
-                        case arrow::Type::UINT16:
-                            std::fill(array_col.ushort_array.begin(), array_col.ushort_array.end(), 0);
-                            break;
-                        case arrow::Type::UINT64:
-                            std::fill(array_col.ulong_array.begin(), array_col.ulong_array.end(), 0);
-                            break;
-                        case arrow::Type::BOOL:
-                            std::fill(array_col.bool_array.begin(), array_col.bool_array.end(), 0);
-                            break;
-                        }
+                    arr_col.float_array.clear();
+                    arr_col.double_array.clear();
+                    arr_col.int_array.clear();
+                    arr_col.short_array.clear();
+                    arr_col.ull_array.clear();
+                    arr_col.ll_array.clear();
+                    arr_col.uint_array.clear();
+                    arr_col.ushort_array.clear();
+                    arr_col.bool_array.clear();
+                    arr_col.string_array.clear();
 
-                        // Fill with actual values if not null
-                        if (!list_array->IsNull(row))
-                        {
-                            int list_length = list_array->value_length(row);
-                            int start_offset = list_array->value_offset(row);
-                            auto values_array = list_array->values();
-                            int elements_to_copy = std::min(list_length, array_col.array_size);
+                    if (list_array->IsNull(row))
+                        continue;
 
-                            switch (array_col.element_type)
-                            {
-                            case arrow::Type::FLOAT:
-                            {
-                                auto float_values = std::static_pointer_cast<arrow::FloatArray>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.float_array[i] = float_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::DOUBLE:
-                            {
-                                auto double_values = std::static_pointer_cast<arrow::DoubleArray>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.double_array[i] = double_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::INT32:
-                            {
-                                auto int_values = std::static_pointer_cast<arrow::Int32Array>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.int_array[i] = int_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::INT16:
-                            {
-                                auto short_values = std::static_pointer_cast<arrow::Int16Array>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.short_array[i] = short_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::INT64:
-                            {
-                                auto long_values = std::static_pointer_cast<arrow::Int64Array>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.long_array[i] = long_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::UINT32:
-                            {
-                                auto uint_values = std::static_pointer_cast<arrow::UInt32Array>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.uint_array[i] = uint_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::UINT16:
-                            {
-                                auto ushort_values = std::static_pointer_cast<arrow::UInt16Array>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.ushort_array[i] = ushort_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::UINT64:
-                            {
-                                auto ulong_values = std::static_pointer_cast<arrow::UInt64Array>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.ulong_array[i] = ulong_values->Value(start_offset + i);
-                                break;
-                            }
-                            case arrow::Type::BOOL:
-                            {
-                                auto bool_values = std::static_pointer_cast<arrow::BooleanArray>(values_array);
-                                for (int i = 0; i < elements_to_copy; ++i)
-                                    array_col.bool_array[i] = bool_values->Value(start_offset + i) ? 1 : 0;
-                                break;
-                            }
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // Handle scalar columns
-                    switch (column_type)
+                    auto values = list_array->values();
+                    int64_t start = list_array->value_offset(row);
+                    int64_t end = list_array->value_offset(row + 1);
+
+                    switch (arr_col.element_type)
                     {
                     case arrow::Type::FLOAT:
                     {
-                        auto float_array = std::static_pointer_cast<arrow::FloatArray>(table->column(col)->chunk(0));
-                        float_columns[col] = float_array->Value(row);
+                        auto arr = std::static_pointer_cast<arrow::FloatArray>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.float_array.push_back(arr->Value(i));
                         break;
                     }
                     case arrow::Type::DOUBLE:
                     {
-                        auto double_array = std::static_pointer_cast<arrow::DoubleArray>(table->column(col)->chunk(0));
-                        double_columns[col] = double_array->Value(row);
+                        auto arr = std::static_pointer_cast<arrow::DoubleArray>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.double_array.push_back(arr->Value(i));
                         break;
                     }
                     case arrow::Type::INT32:
                     {
-                        auto int_array = std::static_pointer_cast<arrow::Int32Array>(table->column(col)->chunk(0));
-                        int_columns[col] = int_array->Value(row);
+                        auto arr = std::static_pointer_cast<arrow::Int32Array>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.int_array.push_back(arr->Value(i));
                         break;
                     }
                     case arrow::Type::INT16:
                     {
-                        auto short_array = std::static_pointer_cast<arrow::Int16Array>(table->column(col)->chunk(0));
-                        short_columns[col] = short_array->Value(row);
-                        break;
-                    }
-                    case arrow::Type::INT64:
-                    {
-                        auto long_array = std::static_pointer_cast<arrow::Int64Array>(table->column(col)->chunk(0));
-                        ll_columns[col] = long_array->Value(row);
-                        break;
-                    }
-                    case arrow::Type::UINT32:
-                    {
-                        auto uint_array = std::static_pointer_cast<arrow::UInt32Array>(table->column(col)->chunk(0));
-                        uint_columns[col] = uint_array->Value(row);
-                        break;
-                    }
-                    case arrow::Type::UINT16:
-                    {
-                        auto ushort_array = std::static_pointer_cast<arrow::UInt16Array>(table->column(col)->chunk(0));
-                        ushort_columns[col] = ushort_array->Value(row);
+                        auto arr = std::static_pointer_cast<arrow::Int16Array>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.short_array.push_back(arr->Value(i));
                         break;
                     }
                     case arrow::Type::UINT64:
                     {
-                        auto ull_array = std::static_pointer_cast<arrow::UInt64Array>(table->column(col)->chunk(0));
-                        ull_columns[col] = ull_array->Value(row);
+                        auto arr = std::static_pointer_cast<arrow::UInt64Array>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.ull_array.push_back(arr->Value(i));
+                        break;
+                    }
+                    case arrow::Type::INT64:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::Int64Array>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.ll_array.push_back(arr->Value(i));
+                        break;
+                    }
+                    case arrow::Type::UINT32:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::UInt32Array>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.uint_array.push_back(arr->Value(i));
+                        break;
+                    }
+                    case arrow::Type::UINT16:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::UInt16Array>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.ushort_array.push_back(arr->Value(i));
                         break;
                     }
                     case arrow::Type::BOOL:
                     {
-                        auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(table->column(col)->chunk(0));
-                        bool_columns[col] = bool_array->Value(row) ? 1 : 0;
+                        auto arr = std::static_pointer_cast<arrow::BooleanArray>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.bool_array.push_back(arr->Value(i) ? 1 : 0);
                         break;
                     }
+                    case arrow::Type::STRING:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::StringArray>(values);
+                        for (int64_t i = start; i < end; ++i)
+                            arr_col.string_array.push_back(arr->IsNull(i) ? std::string() : arr->GetString(i));
+                        break;
+                    }
+                    case arrow::Type::DECIMAL128:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::Decimal128Array>(values);
+
+                        for (int64_t i = start; i < end; ++i)
+                        {
+                            if (arr->IsNull(i))
+                            {
+                                arr_col.double_array.push_back(0.0);
+                            }
+                            else
+                            {
+                                std::string s = arr->FormatValue(i);
+                                arr_col.double_array.push_back(std::stod(s));
+                            }
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+                else
+                {
+                    switch (col_type)
+                    {
+                    case arrow::Type::FLOAT:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::FloatArray>(table->column(col)->chunk(0));
+                        float_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::DOUBLE:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::DoubleArray>(table->column(col)->chunk(0));
+                        double_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::INT32:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::Int32Array>(table->column(col)->chunk(0));
+                        int_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::INT16:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::Int16Array>(table->column(col)->chunk(0));
+                        short_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::UINT64:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::UInt64Array>(table->column(col)->chunk(0));
+                        ull_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::INT64:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::Int64Array>(table->column(col)->chunk(0));
+                        ll_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::UINT32:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::UInt32Array>(table->column(col)->chunk(0));
+                        uint_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::UINT16:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::UInt16Array>(table->column(col)->chunk(0));
+                        ushort_columns[col] = arr->Value(row);
+                        break;
+                    }
+                    case arrow::Type::BOOL:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::BooleanArray>(table->column(col)->chunk(0));
+                        bool_columns[col] = arr->Value(row) ? 1 : 0;
+                        break;
+                    }
+                    case arrow::Type::STRING:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::StringArray>(table->column(col)->chunk(0));
+                        string_columns[col] = arr->IsNull(row) ? std::string() : arr->GetString(row);
+                        break;
+                    }
+                    case arrow::Type::DECIMAL128:
+                    {
+                        auto arr = std::static_pointer_cast<arrow::Decimal128Array>(table->column(col)->chunk(0));
+                        double_columns[col] = arr->IsNull(row) ? 0.0 : std::stod(arr->FormatValue(row));
+                        break;
+                    }
+                    default:
+                        break;
                     }
                 }
             }
+
             tree.Fill();
         }
 
-        // Write and close ROOT file
         tree.Write();
         root_file.Close();
+
         std::cout << "  Conversion complete: " << root_filename << std::endl;
     }
     catch (const std::exception &e)
@@ -530,20 +558,24 @@ void WriteRootFile(const std::string &root_filename, const ParquetData &parquet_
     }
 }
 
-// Main conversion function called by thread pool
 void ConvertSingleParquetToRoot(const std::string &parquet_filename, const std::string &root_filename)
 {
     try
     {
         std::cout << "Reading: " << parquet_filename << std::endl;
 
-        // Read Arrow/Parquet data (fully parallelizable, no locking needed)
         ParquetData parquet_data = ReadParquetFile(parquet_filename);
 
-        std::cout << "  Read " << parquet_data.table->num_rows() << " rows, " 
-                  << parquet_data.table->num_columns() << " columns" << std::endl;
+        if (!parquet_data.table)
+        {
+            std::cerr << "Skipping file due to read failure: " << parquet_filename << std::endl;
+            return;
+        }
 
-        // Write to ROOT file (requires mutex lock)
+        std::cout << "  Read " << parquet_data.table->num_rows()
+                  << " rows, " << parquet_data.table->num_columns()
+                  << " columns" << std::endl;
+
         WriteRootFile(root_filename, parquet_data);
     }
     catch (const std::exception &e)
@@ -552,10 +584,9 @@ void ConvertSingleParquetToRoot(const std::string &parquet_filename, const std::
     }
 }
 
-/** prints usage **/
 void usage(char *argv0)
 {
-    std::cout << "[parquet2root]: Usage: \n"
+    std::cout << "[parquet2root]: Usage:\n"
               << argv0 << " -i [input_parquet_directory] -o [output_directory] [-t num_threads]\n"
               << "  -i: input directory containing parquet files (required)\n"
               << "  -o: output directory for root files (will be created if not exists)\n"
@@ -595,7 +626,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Validate input directory
     if (input_dir.empty())
     {
         std::cerr << "Error: Input directory must be specified with -i flag" << std::endl;
@@ -609,14 +639,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Create output directory if it doesn't exist
     if (!std::filesystem::exists(output_dir))
     {
         std::filesystem::create_directories(output_dir);
         std::cout << "Created output directory: " << output_dir << std::endl;
     }
 
-    // Collect all parquet files
     std::vector<std::string> parquet_files;
     for (const auto &entry : std::filesystem::directory_iterator(input_dir))
     {
@@ -634,28 +662,22 @@ int main(int argc, char *argv[])
 
     std::cout << "Found " << parquet_files.size() << " parquet files" << std::endl;
 
-    // Initialize ROOT in main thread (required for thread safety)
     ROOT::EnableThreadSafety();
 
-    // Create thread pool
     ThreadPool pool(num_threads);
 
-    // Queue conversion tasks
-    for (size_t i = 0; i < parquet_files.size(); ++i)
+    for (const auto &parquet_file : parquet_files)
     {
-        const auto &parquet_file = parquet_files[i];
         std::string filename = std::filesystem::path(parquet_file).stem().string();
         std::string root_file = std::filesystem::path(output_dir) / (filename + ".root");
 
-        // Enqueue the conversion task
         pool.enqueue([parquet_file, root_file]()
                      { ConvertSingleParquetToRoot(parquet_file, root_file); });
     }
 
-    // Wait for all conversions to complete
-    std::cout << "Processing " << parquet_files.size() << " files..." << std::endl;
+    std::cout << "Processing " << parquet_files.size() << " files." << std::endl;
     pool.wait_for_completion();
 
-    std::cout << "All conversions completed! Output files are in: " << output_dir << std::endl;
+    std::cout << "All conversions completed. Output files are in: " << output_dir << std::endl;
     return 0;
 }
